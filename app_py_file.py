@@ -3,23 +3,8 @@ import pandas as pd
 import re
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import io
-import sys
-import subprocess
 
-# --- Attempt to install openpyxl if not found ---
-try:
-    import openpyxl
-except ImportError:
-    st.warning("openpyxl not found. Attempting to install it...")
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "openpyxl"])
-        st.success("openpyxl installed successfully! Please re-run the app.")
-        st.stop() # Stop the app to allow Streamlit to restart and pick up the new package
-    except Exception as e:
-        st.error(f"Failed to install openpyxl: {e}")
-        st.error("Please ensure your Streamlit environment has internet access and correct permissions.")
-        st.stop()
-
+# --- NO programmatic openpyxl installation here. Rely on requirements.txt ---
 
 def update_click_url(original_url, click_tracker, campaign_name):
     """
