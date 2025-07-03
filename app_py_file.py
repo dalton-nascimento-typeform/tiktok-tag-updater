@@ -3,312 +3,248 @@ import pandas as pd
 import re
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import io
-from typing import Dict, List, Optional, Tuple
+import sys
+import subprocess
 
-def extract_url_from_quotes(text: str) -> str:
-    """Extract URL from quotation marks in impression tracker text."""
-    if pd.isna(text) or not isinstance(text, str):
-        return ""
-    
-    # Find content within quotes
-    match = re.search(r'"([^"]*)"', text)
+# --- Attempt to install openpyxl if not found ---
+try:
+    import openpyxl
+except ImportError:
+    st.warning("openpyxl not found. Attempting to install it...")
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "openpyxl"])
+        st.success("openpyxl installed successfully! Please re-run the app.")
+        st.stop() # Stop the app to allow Streamlit to restart and pick up the new package
+    except Exception as e:
+        st.error(f"Failed to install openpyxl: {e}")
+        st.error("Please ensure your Streamlit environment has internet access and correct permissions.")
+        st.stop()
+
+
+def update_click_url(original_url, click_tracker, campaign_name):
+    """
+    Updates the Click URL by prepending the click tracker and appending/updating UTM/TF parameters.
+    """
+    if pd.isna(original_url):
+        original_url = "" # Ensure it's a string if NaN
+
+    # Prepend click tracker if available
+    if pd.notna(click_tracker):
+        updated_url = click_tracker + original_url
+    else:
+        updated_url = original_url
+
+    # Parse the URL to manipulate parameters
+    parsed_url = urlparse(updated_url)
+    query_params = parse_qs(parsed_url.query)
+
+    # Define parameters to append/update
+    params_to_add = {
+        'utm_source': 'tiktok',
+        'utm_medium': 'paid',
+        'utm_campaign': campaign_name,
+        'tf_source': 'tiktok',
+        'tf_medium': 'paid_social',
+        'tf_campaign': campaign_name,
+    }
+
+    # Append/update parameters
+    for key, value in params_to_add.items():
+        if key not in query_params:
+            query_params[key] = [value]
+        # If the parameter exists, ensure its value is correct.
+        elif query_params[key][0] != value and key in ['utm_source', 'utm_medium', 'tf_source', 'tf_medium']:
+            query_params[key] = [value]
+        # For campaign, if it exists, update it to the specific campaign_name if it's different.
+        elif (key == 'utm_campaign' or key == 'tf_campaign') and query_params[key][0] != value:
+            query_params[key] = [value]
+
+    # Reconstruct the query string
+    new_query = urlencode(query_params, doseq=True)
+
+    # Reconstruct the URL
+    final_url = urlunparse(parsed_url._replace(query=new_query))
+
+    return final_url
+
+def extract_impression_url(impression_tracker_string):
+    """
+    Extracts the URL from within quotation marks in the impression tracker string.
+    """
+    if pd.isna(impression_tracker_string):
+        return None
+    # Regex to find content inside single or double quotes
+    match = re.search(r'["\'](.*?)["\']', impression_tracker_string)
     if match:
         return match.group(1)
-    return text.strip()
-
-def parse_url_components(url: str) -> Tuple[str, Dict[str, str]]:
-    """Parse URL and return base URL and parameters dictionary."""
-    if not url or pd.isna(url):
-        return "", {}
-    
-    parsed = urlparse(str(url))
-    params = parse_qs(parsed.query, keep_blank_values=True)
-    
-    # Convert list values to single values
-    param_dict = {k: v[0] if v else "" for k, v in params.items()}
-    
-    # Reconstruct base URL without query parameters
-    base_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, '', parsed.fragment))
-    
-    return base_url, param_dict
-
-def build_url_with_params(base_url: str, params: Dict[str, str]) -> str:
-    """Build URL from base URL and parameters dictionary."""
-    if not base_url:
-        return ""
-    
-    if not params:
-        return base_url
-    
-    # Convert params dict back to query string
-    query_string = urlencode(params, doseq=False)
-    
-    parsed = urlparse(base_url)
-    new_parsed = parsed._replace(query=query_string)
-    
-    return urlunparse(new_parsed)
-
-def update_click_url(original_url: str, click_tracker: str, campaign_name: str) -> str:
-    """Update click URL with tracker and UTM/TF parameters."""
-    if pd.isna(original_url) or not original_url:
-        return ""
-    
-    # Start with original URL
-    current_url = str(original_url).strip()
-    
-    # Prepend click tracker if available
-    if click_tracker and not pd.isna(click_tracker):
-        click_tracker = str(click_tracker).strip()
-        if click_tracker:
-            current_url = click_tracker + current_url
-    
-    # Parse the URL to add missing parameters
-    base_url, params = parse_url_components(current_url)
-    
-    # Add missing UTM parameters
-    if 'utm_source' not in params:
-        params['utm_source'] = 'tiktok'
-    if 'utm_medium' not in params:
-        params['utm_medium'] = 'paid'
-    if 'utm_campaign' not in params:
-        params['utm_campaign'] = str(campaign_name) if campaign_name else ''
-    
-    # Add missing TF parameters
-    if 'tf_source' not in params:
-        params['tf_source'] = 'tiktok'
-    if 'tf_medium' not in params:
-        params['tf_medium'] = 'paid_social'
-    if 'tf_campaign' not in params:
-        params['tf_campaign'] = str(campaign_name) if campaign_name else ''
-    
-    return build_url_with_params(base_url, params)
-
-def find_matching_tag_row(tiktok_row: pd.Series, tag_df: pd.DataFrame) -> Optional[pd.Series]:
-    """Find matching row in tag file based on Campaign Name, Ad Group Name/Placement Name, and Ad Name."""
-    campaign_name = tiktok_row.get('Campaign Name', '')
-    ad_group_name = tiktok_row.get('Ad Group Name', '')
-    ad_name = tiktok_row.get('Ad Name', '')
-    
-    # Create boolean mask for matching
-    mask = (
-        (tag_df['Campaign Name'].astype(str).str.strip() == str(campaign_name).strip()) &
-        (tag_df['Placement Name'].astype(str).str.strip() == str(ad_group_name).strip()) &
-        (tag_df['Ad Name'].astype(str).str.strip() == str(ad_name).strip())
-    )
-    
-    matching_rows = tag_df[mask]
-    
-    if len(matching_rows) > 0:
-        return matching_rows.iloc[0]
-    
     return None
 
-def process_tiktok_file(tiktok_df: pd.DataFrame, tag_dfs: List[pd.DataFrame]) -> Tuple[pd.DataFrame, List[str]]:
-    """Process TikTok file with tag files and return updated dataframe and log messages."""
-    updated_df = tiktok_df.copy()
-    log_messages = []
-    
-    # Track matches and updates
-    total_rows = len(updated_df)
-    matches_found = 0
-    click_url_updates = 0
-    impression_url_updates = 0
-    
-    for idx, row in updated_df.iterrows():
-        campaign_name = row.get('Campaign Name', '')
-        ad_group_name = row.get('Ad Group Name', '')
-        ad_name = row.get('Ad Name', '')
-        
-        # Try to find match in any of the tag files
-        matching_tag_row = None
-        source_file_idx = None
-        
-        for file_idx, tag_df in enumerate(tag_dfs):
-            matching_tag_row = find_matching_tag_row(row, tag_df)
-            if matching_tag_row is not None:
-                source_file_idx = file_idx
-                break
-        
-        if matching_tag_row is not None:
-            matches_found += 1
-            
-            # Update Click URL
-            original_click_url = row.get('Click URL', '')
-            click_tracker = matching_tag_row.get('Click Tracker', '')
-            
-            updated_click_url = update_click_url(original_click_url, click_tracker, campaign_name)
-            
-            if updated_click_url != original_click_url:
-                updated_df.at[idx, 'Click URL'] = updated_click_url
-                click_url_updates += 1
-            
-            # Update Impression tracking URL
-            impression_tracker = matching_tag_row.get('Impression Tracker', '')
-            if impression_tracker and not pd.isna(impression_tracker):
-                extracted_impression_url = extract_url_from_quotes(str(impression_tracker))
-                if extracted_impression_url:
-                    updated_df.at[idx, 'Impression tracking URL'] = extracted_impression_url
-                    impression_url_updates += 1
-        else:
-            log_messages.append(f"No match found for: Campaign='{campaign_name}', Ad Group='{ad_group_name}', Ad='{ad_name}'")
-    
-    # Summary log messages
-    log_messages.insert(0, f"Processing complete:")
-    log_messages.insert(1, f"  • Total rows processed: {total_rows}")
-    log_messages.insert(2, f"  • Matches found: {matches_found}")
-    log_messages.insert(3, f"  • Click URL updates: {click_url_updates}")
-    log_messages.insert(4, f"  • Impression URL updates: {impression_url_updates}")
-    log_messages.insert(5, "")
-    
-    return updated_df, log_messages
+@st.cache_data
+def process_files(tiktok_file_buffer, tag_file_buffer):
+    """
+    Core logic to process TikTok and Tag files, update URLs, and return the processed DataFrame.
+    This function is cached for performance with Streamlit.
+    """
+    # --- Load Data ---
+    # Determine file type for TikTok file and read accordingly
+    if tiktok_file_buffer.name.endswith('.csv'):
+        df_tiktok = pd.read_csv(tiktok_file_buffer)
+    elif tiktok_file_buffer.name.endswith('.xlsx'):
+        # For Excel, the sheet name is 'Ads'
+        df_tiktok = pd.read_excel(tiktok_file_buffer, sheet_name='Ads')
+    else:
+        raise ValueError("Unsupported TikTok file format. Please upload a .csv or .xlsx file.")
 
-def main():
-    st.set_page_config(
-        page_title="TikTok Tracking Tag Updater",
-        page_icon="🎯",
-        layout="wide"
+
+    # Determine file type for Tag file and read accordingly
+    if tag_file_buffer.name.endswith('.csv'):
+        # Header is in row 11, so pandas header parameter should be 10 (0-indexed)
+        df_tags = pd.read_csv(tag_file_buffer, header=10)
+    elif tag_file_buffer.name.endswith('.xlsx'):
+        # For Excel, the sheet name is 'Tracking Ads' and header is in row 11
+        df_tags = pd.read_excel(tag_file_buffer, sheet_name='Tracking Ads', header=10)
+    else:
+        raise ValueError("Unsupported Tag file format. Please upload a .csv or .xlsx file.")
+
+
+    # --- Preprocessing: Clean column names and ensure consistency ---
+    # Strip whitespace from column names for robust matching
+    df_tiktok.columns = df_tiktok.columns.str.strip()
+    df_tags.columns = df_tags.columns.str.strip()
+
+    # Ensure matching columns are treated as strings and fill NA for merging
+    # TikTok columns
+    df_tiktok['Campaign Name'] = df_tiktok['Campaign Name'].astype(str).fillna('')
+    df_tiktok['Ad Group Name'] = df_tiktok['Ad Group Name'].astype(str).fillna('')
+    df_tiktok['Ad Name'] = df_tiktok['Ad Name'].astype(str).fillna('')
+    # IMPORTANT: Use 'Web URL' for TikTok file instead of 'Click URL'
+    if 'Web URL' not in df_tiktok.columns:
+        raise ValueError(
+            f"Expected column 'Web URL' not found in the TikTok file. "
+            f"Available columns are: {df_tiktok.columns.tolist()}"
+        )
+
+
+    # Tag file columns
+    df_tags['Campaign Name'] = df_tags['Campaign Name'].astype(str).fillna('')
+    df_tags['Placement Name'] = df_tags['Placement Name'].astype(str).fillna('')
+    df_tags['Ad Name'] = df_tags['Ad Name'].astype(str).fillna('')
+
+    # --- Identify Click Tracker and Impression Tracker columns ---
+    # Directly use the exact column names provided by the user
+    click_tracker_col = 'Click Tag'
+    impression_tracker_col = 'Impression Tag (image)'
+
+    # Validate that these columns exist in the DataFrame
+    if click_tracker_col not in df_tags.columns:
+        raise ValueError(
+            f"Expected column '{click_tracker_col}' not found in the Tag file. "
+            f"Available columns are: {df_tags.columns.tolist()}"
+        )
+    if impression_tracker_col not in df_tags.columns:
+        raise ValueError(
+            f"Expected column '{impression_tracker_col}' not found in the Tag file. "
+            f"Available columns are: {df_tags.columns.tolist()}"
+        )
+
+    # --- Matching Logic: Merge DataFrames ---
+    # Only select the identified tracker columns from df_tags
+    merged_df = pd.merge(
+        df_tiktok,
+        df_tags[['Campaign Name', 'Placement Name', 'Ad Name', click_tracker_col, impression_tracker_col]],
+        left_on=['Campaign Name', 'Ad Group Name', 'Ad Name'],
+        right_on=['Campaign Name', 'Placement Name', 'Ad Name'],
+        how='left',
+        suffixes=('_tiktok', '_tag') # Suffixes to differentiate columns with same names
     )
-    
-    st.title("🎯 TikTok Tracking Tag Updater")
-    st.markdown("Upload your TikTok export file and DCM tag files to automatically update tracking URLs.")
-    
-    # File upload section
-    st.header("📁 File Upload")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("TikTok Export File")
-        tiktok_file = st.file_uploader(
-            "Upload TikTok export file (Excel)",
-            type=['xlsx', 'xls'],
-            key="tiktok_file",
-            help="Excel file with 'Ads' sheet containing Campaign Name, Ad Group Name, Ad Name, Click URL, and Impression tracking URL columns"
-        )
-    
-    with col2:
-        st.subheader("DCM Tag Files")
-        tag_files = st.file_uploader(
-            "Upload DCM tag files (Excel)",
-            type=['xlsx', 'xls'],
-            accept_multiple_files=True,
-            key="tag_files",
-            help="Excel files with headers in row 11, containing Campaign Name, Placement Name, Ad Name, Click Tracker, and Impression Tracker columns"
-        )
-    
-    if tiktok_file and tag_files:
-        try:
-            # Load TikTok file
-            st.header("📊 Processing Files")
-            
-            with st.spinner("Loading TikTok export file..."):
-                tiktok_df = pd.read_excel(tiktok_file, sheet_name='Ads')
-                st.success(f"✅ TikTok file loaded: {len(tiktok_df)} rows")
-            
-            # Load tag files
-            tag_dfs = []
-            with st.spinner("Loading DCM tag files..."):
-                for i, tag_file in enumerate(tag_files):
-                    tag_df = pd.read_excel(tag_file, header=10)  # Headers in row 11
-                    tag_dfs.append(tag_df)
-                    st.success(f"✅ Tag file {i+1} loaded: {len(tag_df)} rows")
-            
-            # Validate required columns
-            required_tiktok_cols = ['Campaign Name', 'Ad Group Name', 'Ad Name', 'Click URL', 'Impression tracking URL']
-            required_tag_cols = ['Campaign Name', 'Placement Name', 'Ad Name', 'Click Tracker', 'Impression Tracker']
-            
-            missing_tiktok_cols = [col for col in required_tiktok_cols if col not in tiktok_df.columns]
-            if missing_tiktok_cols:
-                st.error(f"❌ Missing columns in TikTok file: {missing_tiktok_cols}")
-                return
-            
-            for i, tag_df in enumerate(tag_dfs):
-                missing_tag_cols = [col for col in required_tag_cols if col not in tag_df.columns]
-                if missing_tag_cols:
-                    st.error(f"❌ Missing columns in tag file {i+1}: {missing_tag_cols}")
-                    return
-            
-            # Process files
-            st.header("🔄 Processing")
-            
-            with st.spinner("Updating tracking URLs..."):
-                updated_df, log_messages = process_tiktok_file(tiktok_df, tag_dfs)
-            
-            # Display results
-            st.header("📈 Results")
-            
-            col1, col2 = st.columns([1, 1])
-            
-            with col1:
-                st.subheader("Processing Log")
-                for message in log_messages:
-                    if message.startswith("  •"):
-                        st.write(message)
-                    elif message.strip():
-                        st.text(message)
-            
-            with col2:
-                st.subheader("Preview Updated Data")
-                st.dataframe(
-                    updated_df[['Campaign Name', 'Ad Group Name', 'Ad Name', 'Click URL', 'Impression tracking URL']].head(10),
-                    use_container_width=True
-                )
-            
-            # Download section
-            st.header("⬇️ Download Updated File")
-            
-            # Convert to Excel
-            output_buffer = io.BytesIO()
-            with pd.ExcelWriter(output_buffer, engine='openpyxl') as writer:
-                updated_df.to_excel(writer, sheet_name='Ads', index=False)
-            
-            output_buffer.seek(0)
-            
-            st.download_button(
-                label="📥 Download Updated TikTok File",
-                data=output_buffer.getvalue(),
-                file_name="updated_tiktok_export.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
-            
-            # Show detailed log if there are unmatched rows
-            unmatched_messages = [msg for msg in log_messages if msg.startswith("No match found")]
-            if unmatched_messages:
-                with st.expander(f"⚠️ Unmatched Rows ({len(unmatched_messages)})", expanded=False):
-                    for message in unmatched_messages:
-                        st.text(message)
-        
-        except Exception as e:
-            st.error(f"❌ Error processing files: {str(e)}")
-            st.exception(e)
-    
-    # Instructions
-    st.header("📋 Instructions")
-    st.markdown("""
-    ### How to use this tool:
-    
-    1. **Upload TikTok Export File**: 
-       - Excel file with an 'Ads' sheet
-       - Must contain: Campaign Name, Ad Group Name, Ad Name, Click URL, Impression tracking URL
-    
-    2. **Upload DCM Tag Files**: 
-       - One or more Excel files with headers in row 11
-       - Must contain: Campaign Name, Placement Name, Ad Name, Click Tracker, Impression Tracker
-    
-    3. **Matching Logic**:
-       - Rows are matched using Campaign Name, Ad Group Name (TikTok) = Placement Name (DCM), and Ad Name
-    
-    4. **Updates Applied**:
-       - **Click URL**: Prepends click tracker and adds missing UTM/TF parameters
-       - **Impression URL**: Extracts URL from quotes in impression tracker
-    
-    5. **Download**: Get your updated TikTok export file with tracking URLs updated
-    
-    ### UTM/TF Parameters Added (if missing):
-    - `utm_source=tiktok`, `utm_medium=paid`, `utm_campaign=<Campaign Name>`
-    - `tf_source=tiktok`, `tf_medium=paid_social`, `tf_campaign=<Campaign Name>`
-    """)
 
-if __name__ == "__main__":
-    main()
+    # --- Update Click URL (now 'Web URL' in tiktok side) ---
+    # Apply the update_click_url function row-wise
+    # Use the original 'Web URL' from TikTok and the dynamically found 'Click Tracker' from the merged data
+    # Pass 'Campaign Name' from the TikTok side for parameter population
+    merged_df['Web URL'] = merged_df.apply( # Changed from 'Click URL' to 'Web URL'
+        lambda row: update_click_url(
+            row['Web URL'], # Changed from 'Click URL' to 'Web URL'
+            row[click_tracker_col],
+            row['Campaign Name'] # Changed from 'Campaign Name_tiktok' to 'Campaign Name'
+        ),
+        axis=1
+    )
+
+    # --- Update Impression tracking URL ---
+    # Apply the extract_impression_url function row-wise
+    merged_df['Impression tracking URL'] = merged_df.apply(
+        lambda row: extract_impression_url(row[impression_tracker_col]),
+        axis=1
+    )
+
+    # --- Final Output Preparation ---
+    # Drop the temporary columns introduced by the merge from the tag file
+    # We only want to keep the original TikTok columns updated
+    columns_to_drop = [col for col in merged_df.columns if col.endswith('_tag') or col in [click_tracker_col, impression_tracker_col, 'Placement Name']]
+    final_df = merged_df.drop(columns=columns_to_drop, errors='ignore')
+
+    return final_df
+
+# --- Streamlit App Interface ---
+st.set_page_config(page_title="TikTok Tag Updater", layout="centered")
+
+st.title("🔗 TikTok Tracking Tag Updater")
+st.markdown("""
+    Upload your TikTok Export file and DCM Tag file to update Click and Impression URLs
+    based on matching Campaign, Ad Group/Placement, and Ad Names.
+""")
+
+# File Uploaders
+tiktok_file = st.file_uploader(
+    "Upload TikTok Export File (e.g., 'ExportAds_Test.xlsx - Ads.csv' or 'ExportAds_Test.xlsx')",
+    type=["csv", "xlsx"]
+)
+tag_file = st.file_uploader(
+    "Upload DCM Tag File (e.g., 'Tags_US-TF-AO-BRA-SS-Prospecting-Online_Video-TikTok-Awareness_Influencers_ReachAndFrequency_Marketing_0_PARENT_ADVERTISER.xlsx - Tracking Ads.csv' or 'Tags_US-TF-AO-BRA-SS-Prospecting-Online_Video-TikTok-Awareness_Influencers_ReachAndFrequency_Marketing_0_PARENT_ADVERTISER.xlsx')",
+    type=["csv", "xlsx"]
+)
+
+if tiktok_file and tag_file:
+    if st.button("Process Files"):
+        with st.spinner("Processing files... This might take a moment."):
+            try:
+                updated_df = process_files(tiktok_file, tag_file)
+                st.success("Files processed successfully!")
+
+                # Provide download button for CSV
+                csv_buffer = io.StringIO()
+                updated_df.to_csv(csv_buffer, index=False)
+                st.download_button(
+                    label="Download Updated TikTok Ads CSV",
+                    data=csv_buffer.getvalue(),
+                    file_name="Updated_TikTok_Ads.csv",
+                    mime="text/csv",
+                    help="Click to download the updated TikTok Ads file in CSV format."
+                )
+
+                # Provide download button for Excel
+                excel_buffer = io.BytesIO()
+                updated_df.to_excel(excel_buffer, index=False, sheet_name='Updated Ads')
+                excel_buffer.seek(0)
+                st.download_button(
+                    label="Download Updated TikTok Ads XLSX",
+                    data=excel_buffer.getvalue(),
+                    file_name="Updated_TikTok_Ads.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    help="Click to download the updated TikTok Ads file in XLSX format."
+                )
+
+                st.dataframe(updated_df.head())
+            except ValueError as ve:
+                st.error(f"File format or column error: {ve}")
+                st.info("Please ensure you are uploading the correct file types (CSV or XLSX) and that the specified sheet names exist if uploading Excel files. Also check the exact column names in your tag file.")
+            except Exception as e:
+                st.error(f"An unexpected error occurred during processing: {e}")
+                st.error("Please ensure your files are in the correct format and the correct sheets are selected.")
+                st.info("Remember: TikTok export file has standard headers in row 1 (sheet 'Ads') with 'Web URL'. Tag files have headers in row 11 (sheet 'Tracking Ads') with 'Click Tag' and 'Impression Tag (image)'.")
+else:
+    st.info("Please upload both TikTok Export and DCM Tag files to proceed.")
+
+st.markdown("---")
+st.markdown("Developed with ❤️ for efficient ad tracking.")
